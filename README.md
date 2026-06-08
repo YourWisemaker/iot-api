@@ -7,7 +7,8 @@ updates over WebSocket.
 
 ## Features
 
-- **Device registration** – register, list, fetch and delete devices via REST.
+- **Device registration** – full CRUD over devices via REST (register, list,
+  fetch, update, delete).
 - **Telemetry ingestion** – ingest metrics over HTTP or MQTT, processed
   asynchronously by a bounded worker pool with backpressure.
 - **MQTT integration** – devices publish to `devices/<id>/telemetry`; the
@@ -32,32 +33,41 @@ updates over WebSocket.
 ## Architecture
 
 ```
-            HTTP / WebSocket                 MQTT
-                  │                            │
-            ┌─────▼─────┐                ┌─────▼─────┐
-            │  api      │                │  mqtt     │
-            │ handlers  │                │  bridge   │
-            └─────┬─────┘                └─────┬─────┘
-                  │        IngestTelemetry     │
-                  └───────────────┬────────────┘
-                                  ▼
-                          ┌───────────────┐
-                          │   service     │
-                          │ (orchestrator)│
-                          └───┬───────┬───┘
-            Submit(job)       │       │      Broadcast(event)
-                 ┌────────────▼─┐   ┌─▼───────────────┐
-                 │ worker pool  │   │ publisher       │
-                 └──────┬───────┘   │ hub │ redis bus │
-                        │           └─────┬───────────┘
-        ┌───────────────┼──────────┐     │
-        ▼               ▼          ▼     ▼
-   ┌─────────┐    ┌──────────┐  ┌──────────┐
-   │  store  │    │  alerts  │  │ realtime │ ──► WebSocket clients
-   │ mongo / │    │  engine  │  │   hub    │
-   │ memory  │    └──────────┘  └──────────┘
+                         HTTP / WebSocket                    MQTT
+                               │                              │
+                     ┌─────────▼──────────┐            ┌──────▼──────┐
+                     │  api (gorilla/mux) │            │ mqtt bridge │
+                     │  JWT auth + RBAC   │            └──────┬──────┘
+                     └─────────┬──────────┘                   │
+                               │          IngestTelemetry     │
+                               └───────────────┬──────────────┘
+                                               ▼
+                                       ┌───────────────┐
+                                       │   service     │
+                                       │ (orchestrator)│
+                                       └───┬───────┬───┘
+                         Submit(job)       │       │      Broadcast(event)
+                              ┌────────────▼─┐   ┌─▼───────────────────┐
+                              │ worker pool  │   │ publisher           │
+                              └──────┬───────┘   │ local hub │ redis   │
+                                     │           └─────┬───────────────┘
+        ┌───────────────┬───────────┼──────────┐      │
+        ▼               ▼           ▼          ▼       ▼
+   ┌─────────┐    ┌──────────┐  ┌────────┐  ┌──────────┐
+   │  store  │    │  alerts  │  │ redis  │  │ realtime │ ──► WebSocket clients
+   │ mongo / │    │  engine  │  │ cache  │  │   hub    │
+   │ memory  │    └──────────┘  └────────┘  └──────────┘
+   │ devices │
+   │ telem.  │   Auth users + refresh tokens live in the same store backend
+   │ alerts  │   (MongoDB or in-memory), with bcrypt-hashed passwords.
+   │ users   │
    └─────────┘
 ```
+
+When Redis is enabled, the service publishes events to a Redis channel instead
+of the local hub directly; each instance subscribes and re-broadcasts to its own
+WebSocket clients, so real-time events fan out across a horizontally scaled
+deployment.
 
 ## Getting started
 
@@ -205,6 +215,43 @@ Publish telemetry to `devices/<id>/telemetry`:
 mosquitto_pub -t devices/<id>/telemetry \
   -m '{"metrics":{"temperature":85}}'
 ```
+
+> When authentication is enabled, the REST examples above also need an
+> `Authorization: Bearer <access_token>` header (see Authentication above).
+
+## Alerts
+
+Telemetry is evaluated against threshold rules as it is ingested; a breach
+persists an alert and pushes it to WebSocket subscribers. The server ships with
+these default rules (configured in `cmd/server/main.go`):
+
+| Metric | Condition | Severity |
+|--------|-----------|----------|
+| `temperature` | `> 80` | `critical` |
+| `battery` | `< 15` | `warning` |
+| `humidity` | `> 95` | `warning` |
+
+Retrieve alerts via `GET /api/alerts` (optionally filtered with `?device_id=`).
+
+## WebSocket events
+
+Connecting to `/ws` streams JSON events as they occur. Each event has the shape:
+
+```json
+{
+  "type": "telemetry",
+  "device_id": "b1c2...",
+  "payload": { "...": "type-specific" },
+  "timestamp": "2026-06-08T12:00:00Z"
+}
+```
+
+Event `type` is one of:
+
+- `device` – a device was registered or updated (payload: the device)
+- `telemetry` – a telemetry sample was ingested (payload: the telemetry)
+- `status` – a device's status changed, e.g. reaped to `offline`
+- `alert` – an alert rule was breached (payload: the alert)
 
 ## Project layout
 
