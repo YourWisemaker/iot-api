@@ -1,9 +1,9 @@
-// Package auth provides JWT issuing/verification and HTTP middleware for
-// protecting the platform's API and WebSocket endpoints.
+// Package auth provides JWT issuing/verification, password-based user
+// authentication backed by the database, refresh tokens, and HTTP middleware
+// for authentication and role-based authorization.
 package auth
 
 import (
-	"crypto/subtle"
 	"errors"
 	"time"
 
@@ -13,28 +13,24 @@ import (
 // ErrInvalidToken is returned when a token cannot be validated.
 var ErrInvalidToken = errors.New("invalid or expired token")
 
-// Claims is the JWT payload issued by the platform.
+// Claims is the JWT access-token payload issued by the platform.
 type Claims struct {
 	Roles []string `json:"roles,omitempty"`
 	jwt.RegisteredClaims
 }
 
-// Manager issues and validates JWTs and authenticates login credentials.
+// Manager issues and validates access JWTs.
 type Manager struct {
-	secret   []byte
-	issuer   string
-	ttl      time.Duration
-	username string
-	password string
+	secret []byte
+	issuer string
+	ttl    time.Duration
 }
 
-// Config configures the auth Manager.
+// Config configures the JWT Manager.
 type Config struct {
-	Secret   string
-	Issuer   string
-	TTL      time.Duration
-	Username string
-	Password string
+	Secret string
+	Issuer string
+	TTL    time.Duration
 }
 
 // NewManager builds a Manager. It returns nil when no secret is provided,
@@ -44,39 +40,22 @@ func NewManager(cfg Config) *Manager {
 		return nil
 	}
 	if cfg.TTL <= 0 {
-		cfg.TTL = time.Hour
+		cfg.TTL = 15 * time.Minute
 	}
 	if cfg.Issuer == "" {
 		cfg.Issuer = "iot-api"
 	}
 	return &Manager{
-		secret:   []byte(cfg.Secret),
-		issuer:   cfg.Issuer,
-		ttl:      cfg.TTL,
-		username: cfg.Username,
-		password: cfg.Password,
+		secret: []byte(cfg.Secret),
+		issuer: cfg.Issuer,
+		ttl:    cfg.TTL,
 	}
 }
 
-// TTL returns the configured token lifetime.
+// TTL returns the configured access-token lifetime.
 func (m *Manager) TTL() time.Duration { return m.ttl }
 
-// LoginEnabled reports whether credential-based login is configured.
-func (m *Manager) LoginEnabled() bool {
-	return m.username != "" && m.password != ""
-}
-
-// ValidateCredentials checks a username/password pair in constant time.
-func (m *Manager) ValidateCredentials(username, password string) bool {
-	if !m.LoginEnabled() {
-		return false
-	}
-	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(m.username)) == 1
-	passOK := subtle.ConstantTimeCompare([]byte(password), []byte(m.password)) == 1
-	return userOK && passOK
-}
-
-// Generate issues a signed token for the subject with the given roles.
+// Generate issues a signed access token for the subject with the given roles.
 func (m *Manager) Generate(subject string, roles []string) (string, error) {
 	now := time.Now()
 	claims := Claims{
@@ -92,7 +71,7 @@ func (m *Manager) Generate(subject string, roles []string) (string, error) {
 	return token.SignedString(m.secret)
 }
 
-// Parse validates a token string and returns its claims.
+// Parse validates an access token string and returns its claims.
 func (m *Manager) Parse(tokenStr string) (*Claims, error) {
 	if tokenStr == "" {
 		return nil, ErrInvalidToken

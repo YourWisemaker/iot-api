@@ -25,8 +25,9 @@ updates over WebSocket.
 - **NoSQL persistence** – MongoDB-backed store (falls back to in-memory).
 - **Redis** – device status cache plus a pub/sub event bus for fanning
   real-time events across multiple API instances.
-- **JWT authentication** – optional bearer-token auth protecting the REST API
-  and WebSocket stream, with a credential-based login endpoint.
+- **JWT authentication** – optional bearer-token auth with database-backed
+  users (bcrypt password hashing), role-based authorization (`admin`,
+  `viewer`), and rotating refresh tokens.
 
 ## Architecture
 
@@ -107,43 +108,73 @@ All configuration is via environment variables (see `.env.example`):
 | `MQTT_BROKER_URL` | _(empty)_ | MQTT broker URL; empty disables MQTT |
 | `MQTT_TOPIC_PREFIX` | `devices` | MQTT topic prefix |
 | `JWT_SECRET` | _(empty)_ | HMAC secret; empty disables authentication |
-| `JWT_TTL` | `1h` | Issued token lifetime |
-| `AUTH_USERNAME` | `admin` | Login username |
-| `AUTH_PASSWORD` | _(empty)_ | Login password; empty disables the login endpoint |
+| `JWT_TTL` | `15m` | Access-token lifetime |
+| `JWT_REFRESH_TTL` | `168h` | Refresh-token lifetime |
+| `ADMIN_USERNAME` | `admin` | Bootstrap admin username |
+| `ADMIN_PASSWORD` | _(empty)_ | Bootstrap admin password; empty skips seeding |
 
-## Authentication
+## Authentication & authorization
 
 Authentication is optional. With `JWT_SECRET` unset the API is open (intended for
 local development). When `JWT_SECRET` is set, every route except `/health` and
-`/api/auth/login` requires a valid `Authorization: Bearer <token>` header.
+the `/api/auth/*` endpoints requires a valid `Authorization: Bearer <token>`.
+
+Users are stored in the database with bcrypt-hashed passwords. On startup, an
+admin user is seeded from `ADMIN_USERNAME`/`ADMIN_PASSWORD` if it does not
+already exist. Two roles are supported: `admin` (full access, including device
+writes and user management) and `viewer` (read access plus telemetry ingestion).
+
+Login returns a short-lived access token and a long-lived refresh token. The
+refresh token is stored only as a SHA-256 hash and is rotated on every use;
+changing a password revokes all of that user's refresh tokens.
 
 ```bash
-# Obtain a token
-TOKEN=$(curl -s -X POST localhost:8080/api/auth/login \
+# Log in
+TOKENS=$(curl -s -X POST localhost:8080/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"<AUTH_PASSWORD>"}' | jq -r .token)
+  -d '{"username":"admin","password":"<ADMIN_PASSWORD>"}')
+ACCESS=$(echo "$TOKENS" | jq -r .access_token)
+REFRESH=$(echo "$TOKENS" | jq -r .refresh_token)
 
 # Call a protected endpoint
-curl -s localhost:8080/api/devices -H "Authorization: Bearer $TOKEN"
+curl -s localhost:8080/api/devices -H "Authorization: Bearer $ACCESS"
+
+# Rotate the refresh token for a new pair
+curl -s -X POST localhost:8080/api/auth/refresh \
+  -H 'Content-Type: application/json' \
+  -d "{\"refresh_token\":\"$REFRESH\"}"
+
+# Create a viewer user (admin only)
+curl -s -X POST localhost:8080/api/users \
+  -H "Authorization: Bearer $ACCESS" -H 'Content-Type: application/json' \
+  -d '{"username":"observer","password":"changeme123","roles":["viewer"]}'
 ```
 
 WebSocket clients (which cannot set custom headers in the browser) may pass the
-token as a query parameter: `ws://localhost:8080/ws?token=<TOKEN>`.
+access token as a query parameter: `ws://localhost:8080/ws?token=<ACCESS>`.
 
 ## API
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
-| `POST` | `/api/auth/login` | Obtain a JWT (when auth is enabled) |
-| `POST` | `/api/devices` | Register a device |
+| `POST` | `/api/auth/login` | Obtain an access + refresh token pair |
+| `POST` | `/api/auth/refresh` | Rotate a refresh token for a new pair |
+| `POST` | `/api/auth/logout` | Revoke a refresh token |
+| `POST` | `/api/devices` | Register a device (admin) |
 | `GET` | `/api/devices` | List devices |
 | `GET` | `/api/devices/{id}` | Get a device |
-| `DELETE` | `/api/devices/{id}` | Delete a device |
+| `PUT` | `/api/devices/{id}` | Update a device (admin) |
+| `DELETE` | `/api/devices/{id}` | Delete a device (admin) |
 | `POST` | `/api/devices/{id}/telemetry` | Ingest telemetry |
 | `GET` | `/api/devices/{id}/telemetry` | Telemetry history (`since`, `limit`) |
 | `GET` | `/api/devices/{id}/analytics` | Aggregates (`since`, optional `metric` for series) |
 | `GET` | `/api/alerts` | List alerts (optional `device_id`) |
+| `POST` | `/api/users` | Create a user (admin) |
+| `GET` | `/api/users` | List users (admin) |
+| `GET` | `/api/users/{id}` | Get a user (admin) |
+| `PUT` | `/api/users/{id}` | Update a user's roles/password (admin) |
+| `DELETE` | `/api/users/{id}` | Delete a user (admin) |
 | `GET` | `/ws` | WebSocket event stream |
 
 ### Examples
@@ -181,9 +212,10 @@ mosquitto_pub -t devices/<id>/telemetry \
 cmd/server            entrypoint, dependency wiring, graceful shutdown
 internal/models       domain types
 internal/config       environment configuration
-internal/store        Store interface, in-memory + MongoDB (NoSQL) impls
+internal/store        Store interfaces, in-memory + MongoDB (NoSQL) impls
+                      (devices, telemetry, alerts, users, refresh tokens)
 internal/cache        Redis status cache + event bus
-internal/auth         JWT issuing/verification + HTTP middleware
+internal/auth         JWT issuing/verification, users, refresh tokens, RBAC middleware
 internal/worker       bounded worker pool
 internal/alerts       threshold rule engine
 internal/analytics    aggregation + time series

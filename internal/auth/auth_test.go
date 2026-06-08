@@ -7,6 +7,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
+func testManager() *Manager {
+	return NewManager(Config{Secret: "test-secret", TTL: time.Hour})
+}
+
 // expiredToken mints a token that expired in the past, signed with the
 // manager's own secret, to exercise expiry validation.
 func expiredToken(t *testing.T, m *Manager) string {
@@ -25,15 +29,6 @@ func expiredToken(t *testing.T, m *Manager) string {
 	return signed
 }
 
-func testManager() *Manager {
-	return NewManager(Config{
-		Secret:   "test-secret",
-		TTL:      time.Hour,
-		Username: "admin",
-		Password: "s3cret",
-	})
-}
-
 func TestNewManagerDisabledWithoutSecret(t *testing.T) {
 	if NewManager(Config{}) != nil {
 		t.Fatal("expected nil manager when no secret configured")
@@ -42,7 +37,7 @@ func TestNewManagerDisabledWithoutSecret(t *testing.T) {
 
 func TestGenerateAndParse(t *testing.T) {
 	m := testManager()
-	token, err := m.Generate("admin", []string{"admin"})
+	token, err := m.Generate("user-1", []string{"admin", "viewer"})
 	if err != nil {
 		t.Fatalf("generate: %v", err)
 	}
@@ -50,17 +45,17 @@ func TestGenerateAndParse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if claims.Subject != "admin" {
-		t.Fatalf("expected subject admin, got %s", claims.Subject)
+	if claims.Subject != "user-1" {
+		t.Fatalf("expected subject user-1, got %s", claims.Subject)
 	}
-	if len(claims.Roles) != 1 || claims.Roles[0] != "admin" {
+	if len(claims.Roles) != 2 {
 		t.Fatalf("unexpected roles %v", claims.Roles)
 	}
 }
 
 func TestParseRejectsTamperedToken(t *testing.T) {
 	m := testManager()
-	token, _ := m.Generate("admin", nil)
+	token, _ := m.Generate("u", nil)
 	if _, err := m.Parse(token + "x"); err == nil {
 		t.Fatal("expected error for tampered token")
 	}
@@ -68,8 +63,8 @@ func TestParseRejectsTamperedToken(t *testing.T) {
 
 func TestParseRejectsWrongSecret(t *testing.T) {
 	m := testManager()
-	token, _ := m.Generate("admin", nil)
-	other := NewManager(Config{Secret: "different", Username: "a", Password: "b"})
+	token, _ := m.Generate("u", nil)
+	other := NewManager(Config{Secret: "different"})
 	if _, err := other.Parse(token); err == nil {
 		t.Fatal("expected error for token signed with a different secret")
 	}
@@ -85,28 +80,5 @@ func TestParseRejectsExpiredToken(t *testing.T) {
 func TestParseEmptyToken(t *testing.T) {
 	if _, err := testManager().Parse(""); err == nil {
 		t.Fatal("expected error for empty token")
-	}
-}
-
-func TestValidateCredentials(t *testing.T) {
-	m := testManager()
-	if !m.ValidateCredentials("admin", "s3cret") {
-		t.Fatal("expected valid credentials to pass")
-	}
-	if m.ValidateCredentials("admin", "wrong") {
-		t.Fatal("expected wrong password to fail")
-	}
-	if m.ValidateCredentials("root", "s3cret") {
-		t.Fatal("expected wrong username to fail")
-	}
-}
-
-func TestLoginDisabledWithoutPassword(t *testing.T) {
-	m := NewManager(Config{Secret: "s", Username: "admin"})
-	if m.LoginEnabled() {
-		t.Fatal("login should be disabled without a password")
-	}
-	if m.ValidateCredentials("admin", "") {
-		t.Fatal("validation should fail when login is disabled")
 	}
 }

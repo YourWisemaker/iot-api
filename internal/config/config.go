@@ -34,10 +34,13 @@ type Config struct {
 	RedisStatusTTL time.Duration
 
 	// JWT authentication. When JWTSecret is empty, authentication is disabled.
-	JWTSecret    string
-	JWTTTL       time.Duration
-	AuthUsername string
-	AuthPassword string
+	JWTSecret  string
+	JWTTTL     time.Duration // access-token lifetime
+	RefreshTTL time.Duration // refresh-token lifetime
+
+	// Bootstrap admin user, seeded at startup when it does not already exist.
+	AdminUsername string
+	AdminPassword string
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -63,10 +66,11 @@ func Load() Config {
 		RedisDB:        getEnvInt("REDIS_DB", 0),
 		RedisStatusTTL: getEnvDuration("REDIS_STATUS_TTL", 5*time.Minute),
 
-		JWTSecret:    getEnv("JWT_SECRET", ""),
-		JWTTTL:       getEnvDuration("JWT_TTL", time.Hour),
-		AuthUsername: getEnv("AUTH_USERNAME", "admin"),
-		AuthPassword: getEnv("AUTH_PASSWORD", ""),
+		JWTSecret:     getEnv("JWT_SECRET", ""),
+		JWTTTL:        getEnvDuration("JWT_TTL", 15*time.Minute),
+		RefreshTTL:    getEnvDuration("JWT_REFRESH_TTL", 7*24*time.Hour),
+		AdminUsername: getEnv("ADMIN_USERNAME", "admin"),
+		AdminPassword: getEnv("ADMIN_PASSWORD", ""),
 	}
 }
 

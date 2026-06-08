@@ -153,6 +153,24 @@ func (svc *Service) DeleteDevice(id string) error {
 	return svc.store.DeleteDevice(id)
 }
 
+// UpdateDevice updates a device's descriptive fields and broadcasts the change.
+func (svc *Service) UpdateDevice(id string, req models.UpdateDeviceRequest) (models.Device, error) {
+	if err := svc.store.UpdateDevice(id, req.Name, req.Type, req.Location, req.Metadata); err != nil {
+		return models.Device{}, err
+	}
+	d, err := svc.GetDevice(id)
+	if err != nil {
+		return models.Device{}, err
+	}
+	svc.publish(models.Event{
+		Type:      "device",
+		DeviceID:  d.ID,
+		Payload:   d,
+		Timestamp: time.Now().UTC(),
+	})
+	return d, nil
+}
+
 // IngestTelemetry submits a telemetry sample for asynchronous processing via
 // the worker pool. It returns false if the pool rejected the job (backpressure).
 func (svc *Service) IngestTelemetry(t models.Telemetry) bool {

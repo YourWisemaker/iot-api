@@ -30,7 +30,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 		models.AlertRule{Metric: "temperature", Operator: ">", Threshold: 80, Severity: models.SeverityCritical},
 	)
 	svc := service.New(store.NewMemoryStore(100), pool, engine, realtime.NewHub(16), time.Second)
-	srv := httptest.NewServer(NewHandler(svc, nil).Routes())
+	srv := httptest.NewServer(NewHandler(svc, nil, nil).Routes())
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -232,14 +232,25 @@ func newAuthedTestServer(t *testing.T) *httptest.Server {
 	t.Cleanup(pool.Stop)
 
 	engine := alerts.NewEngine()
-	svc := service.New(store.NewMemoryStore(100), pool, engine, realtime.NewHub(16), time.Second)
-	mgr := auth.NewManager(auth.Config{Secret: "test-secret", TTL: time.Hour, Username: "admin", Password: "pw"})
-	srv := httptest.NewServer(NewHandler(svc, mgr).Routes())
+	st := store.NewMemoryStore(100)
+	svc := service.New(st, pool, engine, realtime.NewHub(16), time.Second)
+
+	mgr := auth.NewManager(auth.Config{Secret: "test-secret", TTL: time.Hour})
+	authSvc := auth.NewService(st, mgr, time.Hour)
+	if _, err := authSvc.CreateUser("admin", "supersecret", []string{models.RoleAdmin}); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	if _, err := authSvc.CreateUser("viewer", "supersecret", []string{models.RoleViewer}); err != nil {
+		t.Fatalf("seed viewer: %v", err)
+	}
+
+	srv := httptest.NewServer(NewHandler(svc, mgr, authSvc).Routes())
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-func login(t *testing.T, base, user, pass string) (string, int) {
+// login authenticates and returns the access token, refresh token and status.
+func login(t *testing.T, base, user, pass string) (string, string, int) {
 	t.Helper()
 	body, _ := json.Marshal(map[string]string{"username": user, "password": pass})
 	resp, err := http.Post(base+"/api/auth/login", "application/json", bytes.NewReader(body))
@@ -248,10 +259,11 @@ func login(t *testing.T, base, user, pass string) (string, int) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Token string `json:"token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
-	return out.Token, resp.StatusCode
+	return out.AccessToken, out.RefreshToken, resp.StatusCode
 }
 
 func TestProtectedRouteRequiresToken(t *testing.T) {
@@ -268,14 +280,14 @@ func TestProtectedRouteRequiresToken(t *testing.T) {
 
 func TestLoginRejectsBadCredentials(t *testing.T) {
 	srv := newAuthedTestServer(t)
-	if _, code := login(t, srv.URL, "admin", "wrong"); code != http.StatusUnauthorized {
+	if _, _, code := login(t, srv.URL, "admin", "wrong"); code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for bad credentials, got %d", code)
 	}
 }
 
 func TestLoginAndAccessProtectedRoute(t *testing.T) {
 	srv := newAuthedTestServer(t)
-	token, code := login(t, srv.URL, "admin", "pw")
+	token, _, code := login(t, srv.URL, "admin", "supersecret")
 	if code != http.StatusOK || token == "" {
 		t.Fatalf("login failed: code=%d token=%q", code, token)
 	}
@@ -302,10 +314,207 @@ func TestWebSocketRequiresToken(t *testing.T) {
 	}
 
 	// With a token in the query string: handshake should succeed.
-	token, _ := login(t, srv.URL, "admin", "pw")
+	token, _, _ := login(t, srv.URL, "admin", "supersecret")
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL+"?token="+token, nil)
 	if err != nil {
 		t.Fatalf("expected WebSocket to connect with token: %v", err)
 	}
 	conn.Close()
+}
+
+func authedReq(t *testing.T, method, url, token string, body string) *http.Response {
+	t.Helper()
+	var r *http.Request
+	if body != "" {
+		r, _ = http.NewRequest(method, url, strings.NewReader(body))
+	} else {
+		r, _ = http.NewRequest(method, url, nil)
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(r)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	return resp
+}
+
+func TestViewerCannotRegisterDevice(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "viewer", "supersecret")
+
+	resp := authedReq(t, http.MethodPost, srv.URL+"/api/devices", token, `{"name":"d"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for viewer registering device, got %d", resp.StatusCode)
+	}
+}
+
+func TestViewerCanReadDevices(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "viewer", "supersecret")
+
+	resp := authedReq(t, http.MethodGet, srv.URL+"/api/devices", token, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected viewer to read devices, got %d", resp.StatusCode)
+	}
+}
+
+func TestAdminCanRegisterDevice(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "admin", "supersecret")
+
+	resp := authedReq(t, http.MethodPost, srv.URL+"/api/devices", token, `{"name":"d"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected admin to register device, got %d", resp.StatusCode)
+	}
+}
+
+func TestAdminCanCreateUser(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "admin", "supersecret")
+
+	resp := authedReq(t, http.MethodPost, srv.URL+"/api/users", token,
+		`{"username":"dave","password":"supersecret","roles":["viewer"]}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 creating user, got %d", resp.StatusCode)
+	}
+
+	// The new user can log in.
+	if _, _, code := login(t, srv.URL, "dave", "supersecret"); code != http.StatusOK {
+		t.Fatalf("new user could not log in, got %d", code)
+	}
+}
+
+func TestViewerCannotListUsers(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "viewer", "supersecret")
+
+	resp := authedReq(t, http.MethodGet, srv.URL+"/api/users", token, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for viewer listing users, got %d", resp.StatusCode)
+	}
+}
+
+func TestRefreshAndLogoutFlow(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	_, refresh, _ := login(t, srv.URL, "admin", "supersecret")
+
+	// Refresh issues a new pair.
+	resp, err := http.Post(srv.URL+"/api/auth/refresh", "application/json",
+		strings.NewReader(`{"refresh_token":"`+refresh+`"}`))
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	var pair struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&pair)
+	resp.Body.Close()
+	if pair.AccessToken == "" || pair.RefreshToken == "" {
+		t.Fatal("expected new token pair from refresh")
+	}
+
+	// Old refresh token is now invalid (rotation).
+	resp2, _ := http.Post(srv.URL+"/api/auth/refresh", "application/json",
+		strings.NewReader(`{"refresh_token":"`+refresh+`"}`))
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 reusing rotated token, got %d", resp2.StatusCode)
+	}
+	resp2.Body.Close()
+
+	// Logout revokes the current refresh token.
+	resp3, _ := http.Post(srv.URL+"/api/auth/logout", "application/json",
+		strings.NewReader(`{"refresh_token":"`+pair.RefreshToken+`"}`))
+	resp3.Body.Close()
+	resp4, _ := http.Post(srv.URL+"/api/auth/refresh", "application/json",
+		strings.NewReader(`{"refresh_token":"`+pair.RefreshToken+`"}`))
+	if resp4.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after logout, got %d", resp4.StatusCode)
+	}
+	resp4.Body.Close()
+}
+
+func TestAdminCanUpdateDevice(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "admin", "supersecret")
+
+	resp := authedReq(t, http.MethodPost, srv.URL+"/api/devices", token, `{"name":"old","type":"sensor"}`)
+	var d models.Device
+	_ = json.NewDecoder(resp.Body).Decode(&d)
+	resp.Body.Close()
+
+	upd := authedReq(t, http.MethodPut, srv.URL+"/api/devices/"+d.ID, token,
+		`{"name":"new","type":"gateway","location":"lab"}`)
+	defer upd.Body.Close()
+	if upd.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 updating device, got %d", upd.StatusCode)
+	}
+	var got models.Device
+	_ = json.NewDecoder(upd.Body).Decode(&got)
+	if got.Name != "new" || got.Type != "gateway" {
+		t.Fatalf("device not updated: %+v", got)
+	}
+}
+
+func TestViewerCannotUpdateDevice(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	adminToken, _, _ := login(t, srv.URL, "admin", "supersecret")
+	resp := authedReq(t, http.MethodPost, srv.URL+"/api/devices", adminToken, `{"name":"d"}`)
+	var d models.Device
+	_ = json.NewDecoder(resp.Body).Decode(&d)
+	resp.Body.Close()
+
+	viewerToken, _, _ := login(t, srv.URL, "viewer", "supersecret")
+	upd := authedReq(t, http.MethodPut, srv.URL+"/api/devices/"+d.ID, viewerToken, `{"name":"x"}`)
+	defer upd.Body.Close()
+	if upd.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for viewer update, got %d", upd.StatusCode)
+	}
+}
+
+func TestUpdateMissingDeviceReturns404(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "admin", "supersecret")
+	upd := authedReq(t, http.MethodPut, srv.URL+"/api/devices/ghost", token, `{"name":"x"}`)
+	defer upd.Body.Close()
+	if upd.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", upd.StatusCode)
+	}
+}
+
+func TestAdminGetAndUpdateUser(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, _, _ := login(t, srv.URL, "admin", "supersecret")
+
+	// Create a user to operate on.
+	resp := authedReq(t, http.MethodPost, srv.URL+"/api/users", token,
+		`{"username":"erin","password":"supersecret","roles":["viewer"]}`)
+	var created models.User
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	resp.Body.Close()
+
+	// Get by ID.
+	get := authedReq(t, http.MethodGet, srv.URL+"/api/users/"+created.ID, token, "")
+	if get.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 getting user, got %d", get.StatusCode)
+	}
+	get.Body.Close()
+
+	// Update roles.
+	upd := authedReq(t, http.MethodPut, srv.URL+"/api/users/"+created.ID, token, `{"roles":["admin"]}`)
+	defer upd.Body.Close()
+	if upd.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 updating user, got %d", upd.StatusCode)
+	}
+	var updated models.User
+	_ = json.NewDecoder(upd.Body).Decode(&updated)
+	if len(updated.Roles) != 1 || updated.Roles[0] != "admin" {
+		t.Fatalf("roles not updated: %v", updated.Roles)
+	}
 }

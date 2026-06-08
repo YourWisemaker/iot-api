@@ -9,17 +9,19 @@ import (
 
 type contextKey string
 
-// subjectKey stores the authenticated subject in the request context.
-const subjectKey contextKey = "auth.subject"
+// claimsKey stores the authenticated claims in the request context.
+const claimsKey contextKey = "auth.claims"
 
-// PublicPaths are exempt from authentication.
+// defaultPublicPaths are exempt from authentication.
 var defaultPublicPaths = map[string]struct{}{
-	"/health":          {},
-	"/api/auth/login":  {},
+	"/health":           {},
+	"/api/auth/login":   {},
+	"/api/auth/refresh": {},
+	"/api/auth/logout":  {},
 }
 
-// Middleware returns an http middleware that enforces a valid JWT on all
-// non-public routes. Public paths (health, login) pass through untouched.
+// Middleware enforces a valid JWT on all non-public routes and stores the
+// resulting claims in the request context.
 func (m *Manager) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := defaultPublicPaths[r.URL.Path]; ok {
@@ -28,18 +30,55 @@ func (m *Manager) Middleware(next http.Handler) http.Handler {
 		}
 		claims, err := m.Parse(extractToken(r))
 		if err != nil {
-			writeUnauthorized(w)
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		ctx := context.WithValue(r.Context(), subjectKey, claims.Subject)
+		ctx := context.WithValue(r.Context(), claimsKey, claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// SubjectFrom returns the authenticated subject from the request context.
+// RequireRole returns middleware that allows the request only if the
+// authenticated user holds the required role. The admin role is a superuser
+// and satisfies any role requirement.
+func RequireRole(role string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims, ok := ClaimsFrom(r.Context())
+			if !ok {
+				writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+			if !hasRole(claims.Roles, role) && !hasRole(claims.Roles, "admin") {
+				writeJSONError(w, http.StatusForbidden, "insufficient permissions")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ClaimsFrom returns the authenticated claims from the request context.
+func ClaimsFrom(ctx context.Context) (*Claims, bool) {
+	c, ok := ctx.Value(claimsKey).(*Claims)
+	return c, ok
+}
+
+// SubjectFrom returns the authenticated subject (user ID) from the context.
 func SubjectFrom(ctx context.Context) (string, bool) {
-	sub, ok := ctx.Value(subjectKey).(string)
-	return sub, ok
+	if c, ok := ClaimsFrom(ctx); ok {
+		return c.Subject, true
+	}
+	return "", false
+}
+
+func hasRole(roles []string, want string) bool {
+	for _, r := range roles {
+		if r == want {
+			return true
+		}
+	}
+	return false
 }
 
 // extractToken pulls a bearer token from the Authorization header, falling back
@@ -54,8 +93,8 @@ func extractToken(r *http.Request) string {
 	return r.URL.Query().Get("token")
 }
 
-func writeUnauthorized(w http.ResponseWriter) {
+func writeJSONError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusUnauthorized)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }

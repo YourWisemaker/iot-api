@@ -19,6 +19,8 @@ type MongoStore struct {
 	devices    *mongo.Collection
 	telemetry  *mongo.Collection
 	alerts     *mongo.Collection
+	users      *mongo.Collection
+	refresh    *mongo.Collection
 	maxHistory int
 	timeout    time.Duration
 }
@@ -58,6 +60,8 @@ func NewMongoStore(ctx context.Context, cfg MongoConfig) (*MongoStore, error) {
 		devices:    db.Collection("devices"),
 		telemetry:  db.Collection("telemetry"),
 		alerts:     db.Collection("alerts"),
+		users:      db.Collection("users"),
+		refresh:    db.Collection("refresh_tokens"),
 		maxHistory: cfg.MaxHistory,
 		timeout:    cfg.Timeout,
 	}
@@ -83,6 +87,20 @@ func (s *MongoStore) ensureIndexes(ctx context.Context) error {
 	}
 	_, err = s.alerts.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "device_id", Value: 1}, {Key: "created_at", Value: 1}},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.users.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "id", Value: 1}}, Options: options.Index().SetUnique(true)},
+		{Keys: bson.D{{Key: "username", Value: 1}}, Options: options.Index().SetUnique(true)},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.refresh.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "token_hash", Value: 1}},
+		Options: options.Index().SetUnique(true),
 	})
 	return err
 }
@@ -149,6 +167,25 @@ func (s *MongoStore) ListDevices() []models.Device {
 		out = append(out, docToDevice(doc))
 	}
 	return out
+}
+
+// UpdateDevice replaces a device's mutable descriptive fields.
+func (s *MongoStore) UpdateDevice(id string, name, deviceType, location string, metadata map[string]string) error {
+	ctx, cancel := s.ctx()
+	defer cancel()
+	res, err := s.devices.UpdateOne(ctx, bson.M{"id": id}, bson.M{"$set": bson.M{
+		"name":     name,
+		"type":     deviceType,
+		"location": location,
+		"metadata": metadata,
+	}})
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // UpdateDeviceStatus updates a device's status and optionally last-seen time.

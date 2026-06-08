@@ -33,6 +33,14 @@ type RegisterDeviceRequest struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
+// UpdateDeviceRequest is the payload to update a device's descriptive fields.
+type UpdateDeviceRequest struct {
+	Name     string            `json:"name"`
+	Type     string            `json:"type"`
+	Location string            `json:"location"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
 // Telemetry is a single time-series measurement reported by a device.
 type Telemetry struct {
 	DeviceID  string             `json:"device_id"`
@@ -86,4 +94,29 @@ type Event struct {
 	DeviceID  string      `json:"device_id,omitempty"`
 	Payload   interface{} `json:"payload"`
 	Timestamp time.Time   `json:"timestamp"`
+}
+
+// Role constants for authorization.
+const (
+	RoleAdmin  = "admin"
+	RoleViewer = "viewer"
+)
+
+// User is an authenticated principal stored in the database. The password is
+// never stored in plaintext; only a bcrypt hash is persisted.
+type User struct {
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"-"`
+	Roles        []string  `json:"roles"`
+	CreatedAt    time.Time `json:"created_at"`
+}
+
+// RefreshToken is a persisted, hashed refresh token enabling access-token
+// renewal without re-authentication. Only the hash is stored.
+type RefreshToken struct {
+	TokenHash string    `json:"-"`
+	UserID    string    `json:"user_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
 }

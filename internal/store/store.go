@@ -19,6 +19,7 @@ type Store interface {
 	CreateDevice(d models.Device) error
 	GetDevice(id string) (models.Device, error)
 	ListDevices() []models.Device
+	UpdateDevice(id string, name, deviceType, location string, metadata map[string]string) error
 	UpdateDeviceStatus(id string, status models.DeviceStatus, seen time.Time) error
 	DeleteDevice(id string) error
 
@@ -35,6 +36,8 @@ type MemoryStore struct {
 	devices   map[string]models.Device
 	telemetry map[string][]models.Telemetry
 	alerts    map[string][]models.Alert
+	users     map[string]models.User         // keyed by user ID
+	refresh   map[string]models.RefreshToken // keyed by token hash
 	// maxHistory caps the number of telemetry points retained per device.
 	maxHistory int
 }
@@ -45,6 +48,8 @@ func NewMemoryStore(maxHistory int) *MemoryStore {
 		devices:    make(map[string]models.Device),
 		telemetry:  make(map[string][]models.Telemetry),
 		alerts:     make(map[string][]models.Alert),
+		users:      make(map[string]models.User),
+		refresh:    make(map[string]models.RefreshToken),
 		maxHistory: maxHistory,
 	}
 }
@@ -83,6 +88,23 @@ func (s *MemoryStore) ListDevices() []models.Device {
 		return out[i].RegisteredAt.Before(out[j].RegisteredAt)
 	})
 	return out
+}
+
+// UpdateDevice replaces a device's mutable descriptive fields, preserving
+// status, registration and last-seen timestamps.
+func (s *MemoryStore) UpdateDevice(id string, name, deviceType, location string, metadata map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.devices[id]
+	if !ok {
+		return ErrNotFound
+	}
+	d.Name = name
+	d.Type = deviceType
+	d.Location = location
+	d.Metadata = metadata
+	s.devices[id] = d
+	return nil
 }
 
 // UpdateDeviceStatus updates a device's status and last-seen timestamp.

@@ -22,15 +22,17 @@ import (
 type Handler struct {
 	svc      *service.Service
 	auth     *auth.Manager // nil disables authentication
+	authSvc  *auth.Service // nil disables user/login management
 	upgrader websocket.Upgrader
 }
 
 // NewHandler creates an API handler backed by the given service. A nil auth
 // manager disables authentication (suitable for local development).
-func NewHandler(svc *service.Service, authManager *auth.Manager) *Handler {
+func NewHandler(svc *service.Service, authManager *auth.Manager, authSvc *auth.Service) *Handler {
 	return &Handler{
-		svc:  svc,
-		auth: authManager,
+		svc:     svc,
+		auth:    authManager,
+		authSvc: authSvc,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -50,11 +52,15 @@ func (h *Handler) Routes() *mux.Router {
 
 	r.HandleFunc("/health", h.health).Methods(http.MethodGet)
 	r.HandleFunc("/api/auth/login", h.login).Methods(http.MethodPost)
+	r.HandleFunc("/api/auth/refresh", h.refresh).Methods(http.MethodPost)
+	r.HandleFunc("/api/auth/logout", h.logout).Methods(http.MethodPost)
 
-	r.HandleFunc("/api/devices", h.registerDevice).Methods(http.MethodPost)
+	// Device management: writes require the admin role.
+	r.HandleFunc("/api/devices", h.admin(h.registerDevice)).Methods(http.MethodPost)
 	r.HandleFunc("/api/devices", h.listDevices).Methods(http.MethodGet)
 	r.HandleFunc("/api/devices/{id}", h.getDevice).Methods(http.MethodGet)
-	r.HandleFunc("/api/devices/{id}", h.deleteDevice).Methods(http.MethodDelete)
+	r.HandleFunc("/api/devices/{id}", h.admin(h.updateDevice)).Methods(http.MethodPut)
+	r.HandleFunc("/api/devices/{id}", h.admin(h.deleteDevice)).Methods(http.MethodDelete)
 
 	r.HandleFunc("/api/devices/{id}/telemetry", h.ingestTelemetry).Methods(http.MethodPost)
 	r.HandleFunc("/api/devices/{id}/telemetry", h.getTelemetry).Methods(http.MethodGet)
@@ -62,19 +68,36 @@ func (h *Handler) Routes() *mux.Router {
 
 	r.HandleFunc("/api/alerts", h.listAlerts).Methods(http.MethodGet)
 
+	// User management: admin only.
+	r.HandleFunc("/api/users", h.admin(h.createUser)).Methods(http.MethodPost)
+	r.HandleFunc("/api/users", h.admin(h.listUsers)).Methods(http.MethodGet)
+	r.HandleFunc("/api/users/{id}", h.admin(h.getUser)).Methods(http.MethodGet)
+	r.HandleFunc("/api/users/{id}", h.admin(h.updateUser)).Methods(http.MethodPut)
+	r.HandleFunc("/api/users/{id}", h.admin(h.deleteUser)).Methods(http.MethodDelete)
+
 	// WebSocket endpoint for real-time events.
 	r.HandleFunc("/ws", h.websocket)
 
 	return r
 }
 
+// admin wraps a handler with an admin-role requirement. When authentication is
+// disabled the handler is returned unguarded.
+func (h *Handler) admin(next http.HandlerFunc) http.HandlerFunc {
+	if h.auth == nil {
+		return next
+	}
+	guarded := auth.RequireRole(models.RoleAdmin)(next)
+	return guarded.ServeHTTP
+}
+
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// login validates credentials and returns a signed JWT.
+// login authenticates a user against the database and returns a token pair.
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
-	if h.auth == nil {
+	if h.authSvc == nil {
 		writeError(w, http.StatusNotFound, "authentication is disabled")
 		return
 	}
@@ -86,20 +109,161 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if !h.auth.ValidateCredentials(req.Username, req.Password) {
+	pair, err := h.authSvc.Login(req.Username, req.Password)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	token, err := h.auth.Generate(req.Username, []string{"admin"})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not issue token")
+	writeJSON(w, http.StatusOK, pair)
+}
+
+// refresh exchanges a valid refresh token for a new token pair (rotation).
+func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
+	if h.authSvc == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"token":      token,
-		"token_type": "Bearer",
-		"expires_in": int(h.auth.TTL().Seconds()),
-	})
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	pair, err := h.authSvc.Refresh(req.RefreshToken)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid refresh token")
+		return
+	}
+	writeJSON(w, http.StatusOK, pair)
+}
+
+// logout revokes the supplied refresh token.
+func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+	if h.authSvc == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
+		return
+	}
+	var req struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := h.authSvc.Logout(req.RefreshToken); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not revoke token")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// createUser provisions a new user (admin only).
+func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
+	if h.authSvc == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
+		return
+	}
+	var req struct {
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Roles    []string `json:"roles"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Username == "" {
+		writeError(w, http.StatusBadRequest, "username is required")
+		return
+	}
+	user, err := h.authSvc.CreateUser(req.Username, req.Password, req.Roles)
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrWeakPassword):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrDuplicateUser):
+			writeError(w, http.StatusConflict, "username already exists")
+		default:
+			writeError(w, http.StatusInternalServerError, "could not create user")
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, user)
+}
+
+// listUsers returns all users (admin only).
+func (h *Handler) listUsers(w http.ResponseWriter, _ *http.Request) {
+	if h.authSvc == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
+		return
+	}
+	writeJSON(w, http.StatusOK, h.authSvc.ListUsers())
+}
+
+// getUser returns a single user by ID (admin only).
+func (h *Handler) getUser(w http.ResponseWriter, r *http.Request) {
+	if h.authSvc == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
+		return
+	}
+	user, err := h.authSvc.GetUser(mux.Vars(r)["id"])
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "could not fetch user")
+		return
+	}
+	writeJSON(w, http.StatusOK, user)
+}
+
+// updateUser updates a user's roles and/or password (admin only).
+func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) {
+	if h.authSvc == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
+		return
+	}
+	var req struct {
+		Roles    []string `json:"roles"`
+		Password string   `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	user, err := h.authSvc.UpdateUser(mux.Vars(r)["id"], req.Roles, req.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "user not found")
+		case errors.Is(err, auth.ErrWeakPassword):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "could not update user")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, user)
+}
+
+// deleteUser removes a user (admin only).
+func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
+	if h.authSvc == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
+		return
+	}
+	id := mux.Vars(r)["id"]
+	if err := h.authSvc.DeleteUser(id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "could not delete user")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) registerDevice(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +286,30 @@ func (h *Handler) registerDevice(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) listDevices(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, h.svc.ListDevices())
+}
+
+// updateDevice updates a device's descriptive fields (admin only).
+func (h *Handler) updateDevice(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	var req models.UpdateDeviceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	device, err := h.svc.UpdateDevice(id, req)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "device not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, device)
 }
 
 func (h *Handler) getDevice(w http.ResponseWriter, r *http.Request) {

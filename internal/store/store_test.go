@@ -80,6 +80,54 @@ func TestDeleteDevice(t *testing.T) {
 	}
 }
 
+func TestUpdateDevice(t *testing.T) {
+	s := NewMemoryStore(0)
+	_ = s.CreateDevice(newDevice("a"))
+	_ = s.UpdateDeviceStatus("a", models.StatusOnline, time.Now())
+
+	if err := s.UpdateDevice("a", "renamed", "gateway", "warehouse", map[string]string{"k": "v"}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	d, _ := s.GetDevice("a")
+	if d.Name != "renamed" || d.Type != "gateway" || d.Location != "warehouse" {
+		t.Fatalf("fields not updated: %+v", d)
+	}
+	if d.Metadata["k"] != "v" {
+		t.Fatalf("metadata not updated: %+v", d.Metadata)
+	}
+	// Status must be preserved across a descriptive update.
+	if d.Status != models.StatusOnline {
+		t.Fatalf("status should be preserved, got %s", d.Status)
+	}
+}
+
+func TestUpdateMissingDevice(t *testing.T) {
+	s := NewMemoryStore(0)
+	if err := s.UpdateDevice("ghost", "x", "y", "z", nil); err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestUpdateAndDeleteUser(t *testing.T) {
+	s := NewMemoryStore(0)
+	u := models.User{ID: "u1", Username: "alice", Roles: []string{"viewer"}, PasswordHash: "h"}
+	if err := s.CreateUser(u); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	u.Roles = []string{"admin"}
+	u.PasswordHash = "h2"
+	if err := s.UpdateUser(u); err != nil {
+		t.Fatalf("update user: %v", err)
+	}
+	got, _ := s.GetUserByID("u1")
+	if len(got.Roles) != 1 || got.Roles[0] != "admin" || got.PasswordHash != "h2" {
+		t.Fatalf("user not updated: %+v", got)
+	}
+	if err := s.UpdateUser(models.User{ID: "ghost"}); err != ErrNotFound {
+		t.Fatalf("expected ErrNotFound updating missing user, got %v", err)
+	}
+}
+
 func TestAddTelemetryUnknownDevice(t *testing.T) {
 	s := NewMemoryStore(0)
 	err := s.AddTelemetry(models.Telemetry{DeviceID: "ghost", Timestamp: time.Now()})

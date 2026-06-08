@@ -82,3 +82,45 @@ func TestMiddlewareRejectsExpiredToken(t *testing.T) {
 		t.Fatalf("expected 401 for expired token, got %d", rec.Code)
 	}
 }
+
+func TestRequireRoleAllowsMatchingRole(t *testing.T) {
+	m := testManager()
+	token, _ := m.Generate("u", []string{"viewer"})
+	h := m.Middleware(RequireRole("viewer")(okHandler()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+}
+
+func TestRequireRoleAdminIsSuperuser(t *testing.T) {
+	m := testManager()
+	token, _ := m.Generate("u", []string{"admin"})
+	h := m.Middleware(RequireRole("viewer")(okHandler()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin should satisfy any role, got %d", rec.Code)
+	}
+}
+
+func TestRequireRoleForbidsMissingRole(t *testing.T) {
+	m := testManager()
+	token, _ := m.Generate("u", []string{"viewer"})
+	h := m.Middleware(RequireRole("admin")(okHandler()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/users", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+}

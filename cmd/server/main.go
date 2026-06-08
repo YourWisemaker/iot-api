@@ -34,6 +34,7 @@ func main() {
 
 	// Storage backend: MongoDB (NoSQL) when configured, otherwise in-memory.
 	var st store.Store
+	var us store.UserStore
 	if cfg.MongoURI != "" {
 		ms, err := store.NewMongoStore(ctx, store.MongoConfig{
 			URI:        cfg.MongoURI,
@@ -44,10 +45,11 @@ func main() {
 			log.Fatalf("mongo: connect: %v", err)
 		}
 		defer ms.Close(context.Background())
-		st = ms
+		st, us = ms, ms
 		log.Printf("store: using MongoDB at %s (db=%s)", cfg.MongoURI, cfg.MongoDB)
 	} else {
-		st = store.NewMemoryStore(cfg.MaxHistory)
+		mem := store.NewMemoryStore(cfg.MaxHistory)
+		st, us = mem, mem
 		log.Printf("store: using in-memory store (set MONGO_URI to use MongoDB)")
 	}
 
@@ -92,18 +94,27 @@ func main() {
 
 	svc := service.New(st, pool, engine, hub, cfg.OfflineAfter, svcOpts...)
 
-	// Optional JWT authentication.
+	// Optional JWT authentication with database-backed users and refresh tokens.
 	authManager := auth.NewManager(auth.Config{
-		Secret:   cfg.JWTSecret,
-		TTL:      cfg.JWTTTL,
-		Username: cfg.AuthUsername,
-		Password: cfg.AuthPassword,
+		Secret: cfg.JWTSecret,
+		TTL:    cfg.JWTTTL,
 	})
+	var authSvc *auth.Service
 	if authManager == nil {
 		log.Printf("auth: disabled (set JWT_SECRET to require authentication)")
-	} else if !authManager.LoginEnabled() {
-		log.Printf("auth: enabled, but login disabled (set AUTH_PASSWORD to issue tokens)")
 	} else {
+		authSvc = auth.NewService(us, authManager, cfg.RefreshTTL)
+		if cfg.AdminPassword != "" {
+			created, err := authSvc.EnsureUser(cfg.AdminUsername, cfg.AdminPassword, []string{models.RoleAdmin})
+			if err != nil {
+				log.Fatalf("auth: seed admin user: %v", err)
+			}
+			if created {
+				log.Printf("auth: seeded admin user %q", cfg.AdminUsername)
+			}
+		} else {
+			log.Printf("auth: enabled, but no admin seeded (set ADMIN_PASSWORD to bootstrap)")
+		}
 		log.Printf("auth: enabled (JWT required on protected routes)")
 	}
 
@@ -129,7 +140,7 @@ func main() {
 	}
 
 	// HTTP server.
-	handler := api.NewHandler(svc, authManager)
+	handler := api.NewHandler(svc, authManager, authSvc)
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
 		Handler:      handler.Routes(),

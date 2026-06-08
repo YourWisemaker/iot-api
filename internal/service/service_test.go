@@ -167,6 +167,33 @@ func TestReconcileMarksOffline(t *testing.T) {
 	}
 }
 
+func TestUpdateDevice(t *testing.T) {
+	pub := &fakePublisher{}
+	svc, _ := newTestService(t, WithPublisher(pub))
+	d, _ := svc.RegisterDevice(models.RegisterDeviceRequest{Name: "old", Type: "sensor"})
+	before := pub.count()
+
+	updated, err := svc.UpdateDevice(d.ID, models.UpdateDeviceRequest{
+		Name: "new", Type: "gateway", Location: "lab",
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.Name != "new" || updated.Type != "gateway" || updated.Location != "lab" {
+		t.Fatalf("device not updated: %+v", updated)
+	}
+	if pub.count() <= before {
+		t.Fatal("expected an event to be broadcast on update")
+	}
+}
+
+func TestUpdateMissingDevice(t *testing.T) {
+	svc, _ := newTestService(t)
+	if _, err := svc.UpdateDevice("ghost", models.UpdateDeviceRequest{Name: "x"}); err == nil {
+		t.Fatal("expected error updating missing device")
+	}
+}
+
 func TestGetDeviceStatusOverlaidFromCache(t *testing.T) {
 	cache := newFakeCache()
 	svc, _ := newTestService(t, WithStatusCache(cache))
