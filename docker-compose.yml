@@ -1,0 +1,24 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: iot-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    container_name: iot-redis
+    ports:
+      - "6379:6379"
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: iot-mqtt
+    ports:
+      - "1883:1883"
+    command: ["mosquitto", "-c", "/mosquitto-no-auth.conf"]
+
+volumes:
+  mongo-data:
