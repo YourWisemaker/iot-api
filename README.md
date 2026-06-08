@@ -25,6 +25,8 @@ updates over WebSocket.
 - **NoSQL persistence** – MongoDB-backed store (falls back to in-memory).
 - **Redis** – device status cache plus a pub/sub event bus for fanning
   real-time events across multiple API instances.
+- **JWT authentication** – optional bearer-token auth protecting the REST API
+  and WebSocket stream, with a credential-based login endpoint.
 
 ## Architecture
 
@@ -104,12 +106,36 @@ All configuration is via environment variables (see `.env.example`):
 | `REDIS_STATUS_TTL` | `5m` | TTL for cached device status |
 | `MQTT_BROKER_URL` | _(empty)_ | MQTT broker URL; empty disables MQTT |
 | `MQTT_TOPIC_PREFIX` | `devices` | MQTT topic prefix |
+| `JWT_SECRET` | _(empty)_ | HMAC secret; empty disables authentication |
+| `JWT_TTL` | `1h` | Issued token lifetime |
+| `AUTH_USERNAME` | `admin` | Login username |
+| `AUTH_PASSWORD` | _(empty)_ | Login password; empty disables the login endpoint |
+
+## Authentication
+
+Authentication is optional. With `JWT_SECRET` unset the API is open (intended for
+local development). When `JWT_SECRET` is set, every route except `/health` and
+`/api/auth/login` requires a valid `Authorization: Bearer <token>` header.
+
+```bash
+# Obtain a token
+TOKEN=$(curl -s -X POST localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<AUTH_PASSWORD>"}' | jq -r .token)
+
+# Call a protected endpoint
+curl -s localhost:8080/api/devices -H "Authorization: Bearer $TOKEN"
+```
+
+WebSocket clients (which cannot set custom headers in the browser) may pass the
+token as a query parameter: `ws://localhost:8080/ws?token=<TOKEN>`.
 
 ## API
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
+| `POST` | `/api/auth/login` | Obtain a JWT (when auth is enabled) |
 | `POST` | `/api/devices` | Register a device |
 | `GET` | `/api/devices` | List devices |
 | `GET` | `/api/devices/{id}` | Get a device |
@@ -157,6 +183,7 @@ internal/models       domain types
 internal/config       environment configuration
 internal/store        Store interface, in-memory + MongoDB (NoSQL) impls
 internal/cache        Redis status cache + event bus
+internal/auth         JWT issuing/verification + HTTP middleware
 internal/worker       bounded worker pool
 internal/alerts       threshold rule engine
 internal/analytics    aggregation + time series

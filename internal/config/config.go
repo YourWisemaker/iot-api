@@ -32,6 +32,12 @@ type Config struct {
 	RedisPassword  string
 	RedisDB        int
 	RedisStatusTTL time.Duration
+
+	// JWT authentication. When JWTSecret is empty, authentication is disabled.
+	JWTSecret    string
+	JWTTTL       time.Duration
+	AuthUsername string
+	AuthPassword string
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -56,6 +62,11 @@ func Load() Config {
 		RedisPassword:  getEnv("REDIS_PASSWORD", ""),
 		RedisDB:        getEnvInt("REDIS_DB", 0),
 		RedisStatusTTL: getEnvDuration("REDIS_STATUS_TTL", 5*time.Minute),
+
+		JWTSecret:    getEnv("JWT_SECRET", ""),
+		JWTTTL:       getEnvDuration("JWT_TTL", time.Hour),
+		AuthUsername: getEnv("AUTH_USERNAME", "admin"),
+		AuthPassword: getEnv("AUTH_PASSWORD", ""),
 	}
 }
 

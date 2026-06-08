@@ -13,6 +13,7 @@ import (
 
 	"github.com/YourWisemaker/iot-api/internal/alerts"
 	"github.com/YourWisemaker/iot-api/internal/api"
+	"github.com/YourWisemaker/iot-api/internal/auth"
 	"github.com/YourWisemaker/iot-api/internal/cache"
 	"github.com/YourWisemaker/iot-api/internal/config"
 	"github.com/YourWisemaker/iot-api/internal/models"
@@ -91,6 +92,21 @@ func main() {
 
 	svc := service.New(st, pool, engine, hub, cfg.OfflineAfter, svcOpts...)
 
+	// Optional JWT authentication.
+	authManager := auth.NewManager(auth.Config{
+		Secret:   cfg.JWTSecret,
+		TTL:      cfg.JWTTTL,
+		Username: cfg.AuthUsername,
+		Password: cfg.AuthPassword,
+	})
+	if authManager == nil {
+		log.Printf("auth: disabled (set JWT_SECRET to require authentication)")
+	} else if !authManager.LoginEnabled() {
+		log.Printf("auth: enabled, but login disabled (set AUTH_PASSWORD to issue tokens)")
+	} else {
+		log.Printf("auth: enabled (JWT required on protected routes)")
+	}
+
 	// Background status reconciliation.
 	go svc.RunStatusReconciler(ctx, cfg.ReconcileEvery)
 
@@ -113,7 +129,7 @@ func main() {
 	}
 
 	// HTTP server.
-	handler := api.NewHandler(svc)
+	handler := api.NewHandler(svc, authManager)
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
 		Handler:      handler.Routes(),

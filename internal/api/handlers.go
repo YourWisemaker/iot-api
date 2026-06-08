@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/YourWisemaker/iot-api/internal/analytics"
+	"github.com/YourWisemaker/iot-api/internal/auth"
 	"github.com/YourWisemaker/iot-api/internal/models"
 	"github.com/YourWisemaker/iot-api/internal/service"
 	"github.com/YourWisemaker/iot-api/internal/store"
@@ -20,13 +21,16 @@ import (
 // Handler holds dependencies for the HTTP API.
 type Handler struct {
 	svc      *service.Service
+	auth     *auth.Manager // nil disables authentication
 	upgrader websocket.Upgrader
 }
 
-// NewHandler creates an API handler backed by the given service.
-func NewHandler(svc *service.Service) *Handler {
+// NewHandler creates an API handler backed by the given service. A nil auth
+// manager disables authentication (suitable for local development).
+func NewHandler(svc *service.Service, authManager *auth.Manager) *Handler {
 	return &Handler{
-		svc: svc,
+		svc:  svc,
+		auth: authManager,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -40,8 +44,12 @@ func NewHandler(svc *service.Service) *Handler {
 func (h *Handler) Routes() *mux.Router {
 	r := mux.NewRouter()
 	r.Use(jsonContentType)
+	if h.auth != nil {
+		r.Use(h.auth.Middleware)
+	}
 
 	r.HandleFunc("/health", h.health).Methods(http.MethodGet)
+	r.HandleFunc("/api/auth/login", h.login).Methods(http.MethodPost)
 
 	r.HandleFunc("/api/devices", h.registerDevice).Methods(http.MethodPost)
 	r.HandleFunc("/api/devices", h.listDevices).Methods(http.MethodGet)
@@ -62,6 +70,36 @@ func (h *Handler) Routes() *mux.Router {
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// login validates credentials and returns a signed JWT.
+func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	if h.auth == nil {
+		writeError(w, http.StatusNotFound, "authentication is disabled")
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !h.auth.ValidateCredentials(req.Username, req.Password) {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	token, err := h.auth.Generate(req.Username, []string{"admin"})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not issue token")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"token":      token,
+		"token_type": "Bearer",
+		"expires_in": int(h.auth.TTL().Seconds()),
+	})
 }
 
 func (h *Handler) registerDevice(w http.ResponseWriter, r *http.Request) {

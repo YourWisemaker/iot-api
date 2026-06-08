@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/YourWisemaker/iot-api/internal/alerts"
+	"github.com/YourWisemaker/iot-api/internal/auth"
 	"github.com/YourWisemaker/iot-api/internal/models"
 	"github.com/YourWisemaker/iot-api/internal/realtime"
 	"github.com/YourWisemaker/iot-api/internal/service"
@@ -29,7 +30,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 		models.AlertRule{Metric: "temperature", Operator: ">", Threshold: 80, Severity: models.SeverityCritical},
 	)
 	svc := service.New(store.NewMemoryStore(100), pool, engine, realtime.NewHub(16), time.Second)
-	srv := httptest.NewServer(NewHandler(svc).Routes())
+	srv := httptest.NewServer(NewHandler(svc, nil).Routes())
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -222,4 +223,89 @@ func TestWebSocketReceivesEvents(t *testing.T) {
 	if got.DeviceID != d.ID {
 		t.Fatalf("unexpected event device %s", got.DeviceID)
 	}
+}
+
+func newAuthedTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	pool := worker.NewPool(4, 64)
+	pool.Start()
+	t.Cleanup(pool.Stop)
+
+	engine := alerts.NewEngine()
+	svc := service.New(store.NewMemoryStore(100), pool, engine, realtime.NewHub(16), time.Second)
+	mgr := auth.NewManager(auth.Config{Secret: "test-secret", TTL: time.Hour, Username: "admin", Password: "pw"})
+	srv := httptest.NewServer(NewHandler(svc, mgr).Routes())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func login(t *testing.T, base, user, pass string) (string, int) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"username": user, "password": pass})
+	resp, err := http.Post(base+"/api/auth/login", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.Token, resp.StatusCode
+}
+
+func TestProtectedRouteRequiresToken(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	resp, err := http.Get(srv.URL + "/api/devices")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", resp.StatusCode)
+	}
+}
+
+func TestLoginRejectsBadCredentials(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	if _, code := login(t, srv.URL, "admin", "wrong"); code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for bad credentials, got %d", code)
+	}
+}
+
+func TestLoginAndAccessProtectedRoute(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	token, code := login(t, srv.URL, "admin", "pw")
+	if code != http.StatusOK || token == "" {
+		t.Fatalf("login failed: code=%d token=%q", code, token)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/devices", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get devices: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 with token, got %d", resp.StatusCode)
+	}
+}
+
+func TestWebSocketRequiresToken(t *testing.T) {
+	srv := newAuthedTestServer(t)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
+
+	// No token: handshake should be rejected.
+	if _, _, err := websocket.DefaultDialer.Dial(wsURL, nil); err == nil {
+		t.Fatal("expected WebSocket handshake to fail without token")
+	}
+
+	// With a token in the query string: handshake should succeed.
+	token, _ := login(t, srv.URL, "admin", "pw")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL+"?token="+token, nil)
+	if err != nil {
+		t.Fatalf("expected WebSocket to connect with token: %v", err)
+	}
+	conn.Close()
 }

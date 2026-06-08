@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/alicebob/miniredis/v2 v2.33.0
 	github.com/eclipse/paho.mqtt.golang v1.5.0
+	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/mux v1.8.1
 	github.com/gorilla/websocket v1.5.3
